@@ -1,3 +1,4 @@
+mod fetcher;
 mod frontier;
 mod prioritizer;
 mod traits;
@@ -6,24 +7,34 @@ use std::collections::HashSet;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
+use std::num::NonZeroUsize;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use env_logger::Env;
+use fetcher::{CrawlerIdentity, FetchFailure, HttpFetcher, HttpFetcherConfig};
 use frontier::MercatorFrontier;
+use log::{error, info, warn};
 use prioritizer::ConstantPrioritizer;
-use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use thiserror::Error;
 use traits::{CrawlUrl, CrawlUrlError, FetchCompletion, NextUrl, Priority, UrlFrontier};
 use url::Url;
 
-const MAX_FETCHES: usize = 100;
+const MAX_FETCHES: usize = 1000;
 const DEFAULT_OUTPUT_PATH: &str = "output.txt";
 const PRIORITY_LEVELS: u8 = 4;
-const BACK_QUEUE_COUNT: usize = 3;
+const BACK_QUEUE_COUNT: usize = 8;
 const POLITENESS_MULTIPLIER: u32 = 10;
+const CRAWLER_NAME: &str = "weave";
+const CRAWLER_VERSION: &str = "0.1";
+const ROBOTS_CACHE_CAPACITY: NonZeroUsize =
+    NonZeroUsize::new(256).expect("robots cache capacity is non-zero");
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(Env::default().filter_or("RUST_LOG", "info")).init();
+
     let mut args = env::args().skip(1);
     let seed_url = match args.next() {
         Some(seed_url) => seed_url,
@@ -37,7 +48,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| DEFAULT_OUTPUT_PATH.to_string());
 
     let seed = Url::parse(&seed_url)?;
-    let client = Client::builder().build()?;
+    let mut fetcher = HttpFetcher::new(HttpFetcherConfig {
+        identity: CrawlerIdentity::new(CRAWLER_NAME, CRAWLER_VERSION)?,
+        robots_cache_capacity: ROBOTS_CACHE_CAPACITY,
+        request_timeout: REQUEST_TIMEOUT,
+    })?;
     let anchor_selector = Selector::parse("a")?;
     let output = OpenOptions::new()
         .create(true)
@@ -75,37 +90,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         fetches += 1;
-        let current_url = lease.entry.url.url().clone();
-        println!("fetching ({fetches}/{MAX_FETCHES}): {current_url}");
+        let current_url = lease.entry.url.clone();
+        info!("fetching ({fetches}/{MAX_FETCHES}): {current_url}");
 
-        let fetch_started = Instant::now();
-        let Ok(response) = client.get(current_url.clone()).send() else {
-            eprintln!("failed to fetch {current_url}");
-            frontier.complete(FetchCompletion {
-                lease,
-                fetch_duration: fetch_started.elapsed(),
-            });
-            continue;
+        let report = fetcher.fetch(&current_url);
+
+        if report.requested_url != report.final_url {
+            info!(
+                "redirected: {} -> {}",
+                report.requested_url, report.final_url
+            );
+        }
+
+        let document = match report.result {
+            Ok(document) => document,
+            Err(FetchFailure::ExcludedByRobots) => {
+                warn!("excluded by robots.txt: {}", report.final_url);
+                frontier.complete(FetchCompletion {
+                    lease,
+                    fetch_duration: report.duration,
+                });
+                continue;
+            }
+            Err(FetchFailure::Error(error)) => {
+                warn!("failed to fetch {}: {error}", report.final_url);
+                frontier.complete(FetchCompletion {
+                    lease,
+                    fetch_duration: report.duration,
+                });
+                continue;
+            }
         };
 
-        let Ok(body) = response.text() else {
-            eprintln!("failed to read response body for {current_url}");
+        if !document.status.is_success() || !is_html(&document.content_type) {
             frontier.complete(FetchCompletion {
                 lease,
-                fetch_duration: fetch_started.elapsed(),
+                fetch_duration: report.duration,
             });
             continue;
-        };
-        let fetch_duration = fetch_started.elapsed();
+        }
 
-        let document = Html::parse_document(&body);
+        let html = Html::parse_document(&document.body);
 
-        for element in document.select(&anchor_selector) {
+        for element in html.select(&anchor_selector) {
             let Some(href) = element.value().attr("href") else {
                 continue;
             };
 
-            let Ok(next_url) = current_url.join(href) else {
+            let Ok(next_url) = report.final_url.url().join(href) else {
                 continue;
             };
 
@@ -114,19 +146,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Err(error) = enqueue_url(&mut frontier, &mut seen, &mut writer, next_url) {
-                eprintln!("failed to write discovered URL: {error}");
+                error!("failed to write discovered URL: {error}");
                 continue;
             }
         }
 
         frontier.complete(FetchCompletion {
             lease,
-            fetch_duration,
+            fetch_duration: report.duration,
         });
     }
 
-    println!("done after {fetches} fetches");
+    info!("done after {fetches} fetches");
     Ok(())
+}
+
+fn is_html(content_type: &Option<String>) -> bool {
+    content_type
+        .as_deref()
+        .map(|content_type| {
+            content_type
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/html")
+        })
+        .unwrap_or(false)
 }
 
 fn enqueue_url(

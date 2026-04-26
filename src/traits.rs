@@ -1,3 +1,4 @@
+use std::fmt;
 use std::num::NonZeroU8;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -23,10 +24,18 @@ pub struct CrawlUrl {
 
 impl CrawlUrl {
     pub fn new(url: Url) -> Result<Self, CrawlUrlError> {
-        match url.host_str().map(str::to_owned) {
-            Some(host) => Ok(Self { url, host }),
-            None => return Err(CrawlUrlError::MissingHost { url }),
+        let Some(host) = url.host_str().map(str::to_owned) else {
+            return Err(CrawlUrlError::MissingHost { url });
+        };
+
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(CrawlUrlError::UnsupportedScheme {
+                scheme: url.scheme().to_string(),
+                url,
+            });
         }
+
+        Ok(Self { url, host })
     }
 
     pub fn host(&self) -> &str {
@@ -37,6 +46,13 @@ impl CrawlUrl {
         &self.url
     }
 }
+
+impl fmt::Display for CrawlUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.url.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontierEntry {
     pub url: CrawlUrl,
@@ -78,4 +94,6 @@ pub enum NextUrl {
 pub enum CrawlUrlError {
     #[error("URL has no host: {url}")]
     MissingHost { url: Url },
+    #[error("unsupported URL scheme {scheme}: {url}")]
+    UnsupportedScheme { scheme: String, url: Url },
 }

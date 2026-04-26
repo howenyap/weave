@@ -395,6 +395,14 @@ mod tests {
     }
 
     #[test]
+    fn add_rejects_unsupported_url_schemes() {
+        assert!(matches!(
+            CrawlUrl::new(url("ftp://example.com/file")),
+            Err(CrawlUrlError::UnsupportedScheme { scheme, .. }) if scheme == "ftp"
+        ));
+    }
+
+    #[test]
     fn next_returns_empty_when_no_urls_exist() {
         let mut frontier = frontier();
 
