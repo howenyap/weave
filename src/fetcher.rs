@@ -1,25 +1,26 @@
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, ensure};
 use log::warn;
 use lru::LruCache;
-use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, LOCATION};
 use reqwest::redirect::Policy;
-use reqwest::{StatusCode, Url};
+use reqwest::{Client, StatusCode, Url};
 use robotstxt::DefaultMatcher;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::traits::{CrawlUrl, CrawlUrlError};
 
 const MAX_REDIRECTS: usize = 10;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct HttpFetcher {
     client: Client,
     identity: CrawlerIdentity,
-    robots_cache: RobotsCache,
+    robots_cache: Arc<Mutex<RobotsCache>>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,18 +122,18 @@ impl HttpFetcher {
         Ok(Self {
             client,
             identity: config.identity,
-            robots_cache: RobotsCache::new(config.robots_cache_capacity),
+            robots_cache: Arc::new(Mutex::new(RobotsCache::new(config.robots_cache_capacity))),
         })
     }
 
-    pub fn fetch(&mut self, url: &CrawlUrl) -> FetchReport {
+    pub async fn fetch(&self, url: &CrawlUrl) -> FetchReport {
         let started = Instant::now();
         let requested_url = url.clone();
         let mut current_url = url.clone();
         let mut redirects = 0;
 
         loop {
-            if !self.is_allowed_by_robots(&current_url) {
+            if !self.is_allowed_by_robots(&current_url).await {
                 return FetchReport::new(
                     requested_url,
                     current_url,
@@ -141,7 +142,7 @@ impl HttpFetcher {
                 );
             }
 
-            let response = match self.client.get(current_url.url().clone()).send() {
+            let response = match self.client.get(current_url.url().clone()).send().await {
                 Ok(response) => response,
                 Err(error) => {
                     return FetchReport::new(
@@ -221,7 +222,7 @@ impl HttpFetcher {
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            let body = match response.text() {
+            let body = match response.text().await {
                 Ok(body) => body,
                 Err(error) => {
                     return FetchReport::new(
@@ -246,25 +247,25 @@ impl HttpFetcher {
         }
     }
 
-    fn is_allowed_by_robots(&mut self, url: &CrawlUrl) -> bool {
+    async fn is_allowed_by_robots(&self, url: &CrawlUrl) -> bool {
         let origin = OriginKey::from_crawl_url(url);
 
-        if let Some(rules) = self.robots_cache.get(&origin) {
+        if let Some(rules) = self.robots_cache.lock().await.get(&origin) {
             return rules.allows(url.url(), self.identity.robots_user_agent());
         }
 
-        let rules = self.fetch_robots_rules(url);
-        let rules = self.robots_cache.insert(origin, rules);
+        let rules = self.fetch_robots_rules(url).await;
+        let rules = self.robots_cache.lock().await.insert(origin, rules);
 
         rules.allows(url.url(), self.identity.robots_user_agent())
     }
 
-    fn fetch_robots_rules(&self, url: &CrawlUrl) -> RobotsRules {
+    async fn fetch_robots_rules(&self, url: &CrawlUrl) -> RobotsRules {
         let mut robots_url = robots_url(url.url());
         let mut redirects = 0;
 
         let response = loop {
-            let response = match self.client.get(robots_url.clone()).send() {
+            let response = match self.client.get(robots_url.clone()).send().await {
                 Ok(response) => response,
                 Err(error) => {
                     warn!(
@@ -354,7 +355,21 @@ impl HttpFetcher {
             return RobotsRules::AllowAll;
         }
 
-        match response.text() {
+        let is_robots_txt_url = robots_url
+            .path()
+            .to_ascii_lowercase()
+            .ends_with("robots.txt");
+        if !is_robots_txt_url {
+            warn!(
+                "robots.txt for {} redirected to non-robots URL {}; disallowing crawl",
+                url.host(),
+                robots_url
+            );
+
+            return RobotsRules::DisallowAll;
+        }
+
+        match response.text().await {
             Ok(body) => RobotsRules::Rules(body),
             Err(error) => {
                 warn!(
@@ -421,12 +436,12 @@ impl RobotsCache {
         }
     }
 
-    fn get(&mut self, key: &OriginKey) -> Option<&RobotsRules> {
-        self.entries.get(key)
+    fn get(&mut self, key: &OriginKey) -> Option<RobotsRules> {
+        self.entries.get(key).cloned()
     }
 
-    fn insert(&mut self, key: OriginKey, rules: RobotsRules) -> &RobotsRules {
-        self.entries.get_or_insert(key, || rules)
+    fn insert(&mut self, key: OriginKey, rules: RobotsRules) -> RobotsRules {
+        self.entries.get_or_insert(key, || rules).clone()
     }
 }
 
@@ -530,8 +545,8 @@ mod tests {
         assert!(rules.allows(&url("https://example.com/public/page"), "weave"));
     }
 
-    #[test]
-    fn cache_reuses_rules_for_same_host() {
+    #[tokio::test]
+    async fn cache_reuses_rules_for_same_host() {
         let server = TestServer::new(vec![
             response(
                 "/robots.txt",
@@ -542,22 +557,22 @@ mod tests {
             response("/one", 200, "text/html", "<a href=\"/two\">two</a>"),
             response("/two", 200, "text/html", "done"),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/one"))).result,
+            fetcher.fetch(&crawl_url(&server.url("/one"))).await.result,
             Ok(_)
         ));
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/two"))).result,
+            fetcher.fetch(&crawl_url(&server.url("/two"))).await.result,
             Ok(_)
         ));
 
         assert_eq!(server.request_count("/robots.txt"), 1);
     }
 
-    #[test]
-    fn cache_evicts_when_capacity_is_exceeded() {
+    #[tokio::test]
+    async fn cache_evicts_when_capacity_is_exceeded() {
         let first = TestServer::new(vec![
             response(
                 "/robots.txt",
@@ -577,18 +592,18 @@ mod tests {
             ),
             response("/one", 200, "text/html", "one"),
         ]);
-        let mut fetcher = test_fetcher(1);
+        let fetcher = test_fetcher(1);
 
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&first.url("/one"))).result,
+            fetcher.fetch(&crawl_url(&first.url("/one"))).await.result,
             Ok(_)
         ));
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&second.url("/one"))).result,
+            fetcher.fetch(&crawl_url(&second.url("/one"))).await.result,
             Ok(_)
         ));
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&first.url("/two"))).result,
+            fetcher.fetch(&crawl_url(&first.url("/two"))).await.result,
             Ok(_)
         ));
 
@@ -596,8 +611,8 @@ mod tests {
         assert_eq!(second.request_count("/robots.txt"), 1);
     }
 
-    #[test]
-    fn blocked_page_is_not_requested() {
+    #[tokio::test]
+    async fn blocked_page_is_not_requested() {
         let server = TestServer::new(vec![
             response(
                 "/robots.txt",
@@ -607,62 +622,66 @@ mod tests {
             ),
             response("/blocked", 200, "text/html", "blocked"),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/blocked"))).result,
+            fetcher
+                .fetch(&crawl_url(&server.url("/blocked")))
+                .await
+                .result,
             Err(FetchFailure::ExcludedByRobots)
         ));
 
         assert_eq!(server.request_count("/blocked"), 0);
     }
 
-    #[test]
-    fn not_found_robots_allows_page_fetch() {
+    #[tokio::test]
+    async fn not_found_robots_allows_page_fetch() {
         let server = TestServer::new(vec![
             response("/robots.txt", 404, "text/plain", "missing"),
             response("/page", 200, "text/html", "ok"),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/page"))).result,
+            fetcher.fetch(&crawl_url(&server.url("/page"))).await.result,
             Ok(_)
         ));
     }
 
-    #[test]
-    fn robots_server_error_disallows_page_fetch() {
+    #[tokio::test]
+    async fn robots_server_error_disallows_page_fetch() {
         let server = TestServer::new(vec![
             response("/robots.txt", 500, "text/plain", "bad"),
             response("/page", 200, "text/html", "ok"),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/page"))).result,
+            fetcher.fetch(&crawl_url(&server.url("/page"))).await.result,
             Err(FetchFailure::ExcludedByRobots)
         ));
         assert_eq!(server.request_count("/page"), 0);
     }
 
-    #[test]
-    fn robots_network_error_disallows_page_fetch() {
+    #[tokio::test]
+    async fn robots_network_error_disallows_page_fetch() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
         assert!(matches!(
             fetcher
                 .fetch(&crawl_url(&format!("http://{address}/page")))
+                .await
                 .result,
             Err(FetchFailure::ExcludedByRobots)
         ));
     }
 
-    #[test]
-    fn robots_redirect_to_disallowing_rules_blocks_page_fetch() {
+    #[tokio::test]
+    async fn robots_redirect_to_disallowing_rules_blocks_page_fetch() {
         let server = TestServer::new(vec![
             redirect_response("/robots.txt", "/redirected-robots.txt"),
             response(
@@ -673,10 +692,13 @@ mod tests {
             ),
             response("/blocked", 200, "text/html", "blocked"),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/blocked"))).result,
+            fetcher
+                .fetch(&crawl_url(&server.url("/blocked")))
+                .await
+                .result,
             Err(FetchFailure::ExcludedByRobots)
         ));
         assert_eq!(server.request_count("/robots.txt"), 1);
@@ -684,23 +706,46 @@ mod tests {
         assert_eq!(server.request_count("/blocked"), 0);
     }
 
-    #[test]
-    fn non_followable_robots_redirect_disallows_page_fetch() {
+    #[tokio::test]
+    async fn robots_redirect_to_non_robots_url_disallows_page_fetch() {
+        let server = TestServer::new(vec![
+            redirect_response("/robots.txt", "/login"),
+            response(
+                "/login",
+                200,
+                "text/html",
+                "<html><body>User-agent: *\nAllow: /</body></html>",
+            ),
+            response("/page", 200, "text/html", "ok"),
+        ]);
+        let fetcher = test_fetcher(8);
+
+        assert!(matches!(
+            fetcher.fetch(&crawl_url(&server.url("/page"))).await.result,
+            Err(FetchFailure::ExcludedByRobots)
+        ));
+        assert_eq!(server.request_count("/robots.txt"), 1);
+        assert_eq!(server.request_count("/login"), 1);
+        assert_eq!(server.request_count("/page"), 0);
+    }
+
+    #[tokio::test]
+    async fn non_followable_robots_redirect_disallows_page_fetch() {
         let server = TestServer::new(vec![
             response("/robots.txt", 300, "text/plain", "multiple choices"),
             response("/page", 200, "text/html", "ok"),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/page"))).result,
+            fetcher.fetch(&crawl_url(&server.url("/page"))).await.result,
             Err(FetchFailure::ExcludedByRobots)
         ));
         assert_eq!(server.request_count("/page"), 0);
     }
 
-    #[test]
-    fn redirect_to_disallowed_same_origin_path_is_not_requested() {
+    #[tokio::test]
+    async fn redirect_to_disallowed_same_origin_path_is_not_requested() {
         let server = TestServer::new(vec![
             response(
                 "/robots.txt",
@@ -711,18 +756,21 @@ mod tests {
             redirect_response("/start", "/private"),
             response("/private", 200, "text/html", "private"),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/start"))).result,
+            fetcher
+                .fetch(&crawl_url(&server.url("/start")))
+                .await
+                .result,
             Err(FetchFailure::ExcludedByRobots)
         ));
         assert_eq!(server.request_count("/start"), 1);
         assert_eq!(server.request_count("/private"), 0);
     }
 
-    #[test]
-    fn redirect_to_disallowed_other_origin_is_not_requested() {
+    #[tokio::test]
+    async fn redirect_to_disallowed_other_origin_is_not_requested() {
         let target = TestServer::new(vec![
             response(
                 "/robots.txt",
@@ -741,10 +789,13 @@ mod tests {
             ),
             redirect_response("/start", &target.url("/blocked")),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
         assert!(matches!(
-            fetcher.fetch(&crawl_url(&source.url("/start"))).result,
+            fetcher
+                .fetch(&crawl_url(&source.url("/start")))
+                .await
+                .result,
             Err(FetchFailure::ExcludedByRobots)
         ));
         assert_eq!(source.request_count("/start"), 1);
@@ -752,8 +803,8 @@ mod tests {
         assert_eq!(target.request_count("/blocked"), 0);
     }
 
-    #[test]
-    fn allowed_redirect_sets_final_url() {
+    #[tokio::test]
+    async fn allowed_redirect_sets_final_url() {
         let server = TestServer::new(vec![
             response(
                 "/robots.txt",
@@ -764,9 +815,9 @@ mod tests {
             redirect_response("/start", "/final"),
             response("/final", 200, "text/html", "final"),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
-        let report = fetcher.fetch(&crawl_url(&server.url("/start")));
+        let report = fetcher.fetch(&crawl_url(&server.url("/start"))).await;
         let Ok(_) = report.result else {
             panic!("expected fetched document");
         };
@@ -775,8 +826,8 @@ mod tests {
         assert_eq!(report.final_url.url().as_str(), server.url("/final"));
     }
 
-    #[test]
-    fn non_followable_page_3xx_without_location_is_fetched() {
+    #[tokio::test]
+    async fn non_followable_page_3xx_without_location_is_fetched() {
         let server = TestServer::new(vec![
             response(
                 "/robots.txt",
@@ -786,9 +837,9 @@ mod tests {
             ),
             response("/multiple", 300, "text/html", "choose"),
         ]);
-        let mut fetcher = test_fetcher(8);
+        let fetcher = test_fetcher(8);
 
-        let report = fetcher.fetch(&crawl_url(&server.url("/multiple")));
+        let report = fetcher.fetch(&crawl_url(&server.url("/multiple"))).await;
         let Ok(document) = report.result else {
             panic!("expected fetched document");
         };
