@@ -559,14 +559,20 @@ mod tests {
         ]);
         let fetcher = test_fetcher(8);
 
-        assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/one"))).await.result,
-            Ok(_)
-        ));
-        assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/two"))).await.result,
-            Ok(_)
-        ));
+        assert!(
+            fetcher
+                .fetch(&crawl_url(&server.url("/one")))
+                .await
+                .result
+                .is_ok()
+        );
+        assert!(
+            fetcher
+                .fetch(&crawl_url(&server.url("/two")))
+                .await
+                .result
+                .is_ok()
+        );
 
         assert_eq!(server.request_count("/robots.txt"), 1);
     }
@@ -594,18 +600,27 @@ mod tests {
         ]);
         let fetcher = test_fetcher(1);
 
-        assert!(matches!(
-            fetcher.fetch(&crawl_url(&first.url("/one"))).await.result,
-            Ok(_)
-        ));
-        assert!(matches!(
-            fetcher.fetch(&crawl_url(&second.url("/one"))).await.result,
-            Ok(_)
-        ));
-        assert!(matches!(
-            fetcher.fetch(&crawl_url(&first.url("/two"))).await.result,
-            Ok(_)
-        ));
+        assert!(
+            fetcher
+                .fetch(&crawl_url(&first.url("/one")))
+                .await
+                .result
+                .is_ok()
+        );
+        assert!(
+            fetcher
+                .fetch(&crawl_url(&second.url("/one")))
+                .await
+                .result
+                .is_ok()
+        );
+        assert!(
+            fetcher
+                .fetch(&crawl_url(&first.url("/two")))
+                .await
+                .result
+                .is_ok()
+        );
 
         assert_eq!(first.request_count("/robots.txt"), 2);
         assert_eq!(second.request_count("/robots.txt"), 1);
@@ -643,10 +658,13 @@ mod tests {
         ]);
         let fetcher = test_fetcher(8);
 
-        assert!(matches!(
-            fetcher.fetch(&crawl_url(&server.url("/page"))).await.result,
-            Ok(_)
-        ));
+        assert!(
+            fetcher
+                .fetch(&crawl_url(&server.url("/page")))
+                .await
+                .result
+                .is_ok()
+        );
     }
 
     #[tokio::test]

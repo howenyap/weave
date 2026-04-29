@@ -173,9 +173,7 @@ impl<P: UrlPrioritizer> UrlFrontier for MercatorFrontier<P> {
     fn next(&mut self) -> Option<NextUrl> {
         self.activate_inactive_back_queues();
 
-        let Some(Reverse(queue_handle)) = self.ready_heap.pop() else {
-            return None;
-        };
+        let Reverse(queue_handle) = self.ready_heap.pop()?;
 
         if queue_handle.ready_at > Instant::now() {
             self.ready_heap.push(Reverse(queue_handle));
